@@ -1,0 +1,301 @@
+from flask import Flask, request, jsonify
+import subprocess
+import json
+import re
+from pydantic import ValidationError
+from models import (
+    FormDefinition, Control, ControlType,
+    Dimension, Column, Row, GridProperties, ParentProperties
+)
+
+app = Flask(__name__)
+
+# Allowed control types (automatically from models)
+try:
+    valid_controls = list(ControlType.__args__)
+except AttributeError:
+    valid_controls = []
+
+# -------- Compact example form schema with basic controls --------
+grid_props = GridProperties(
+    columnGap=Dimension(size=10, unit="PX"),
+    rowGap=Dimension(size=10, unit="PX"),
+    columns=[Column(id=1, width=Dimension(size=1, unit="FR")),
+             Column(id=2, width=Dimension(size=2, unit="FR"))],
+    rows=[Row(id=i, height=Dimension(size=35, unit="PX")) for i in range(1, 6)]
+)
+
+example_form = FormDefinition(
+    clientWorkflows=[],
+    serverWorkflows=[],
+    controls=[
+        Control(id="FORM001", name="CompactForm", type="FormViewer",
+                properties={}, templateId="FormTemplate1"),
+        Control(id="GRID001", name="MainGrid", type="Grid",
+                properties=grid_props, templateId="Grid1", parentId="FORM001"),
+        Control(id="LBL001", name="LabelName", type="TextBlock",
+                properties={"text": "Full Name:", "editable": False, "visible": "Visible"},
+                templateId="TextBlock1", parentId="GRID001",
+                parentProperties=ParentProperties(column=1, row=1)),
+        Control(id="TXT001", name="TextBoxName", type="TextBox",
+                properties={"value": "", "placeholder": "Enter full name", "valueType": "string", "visible": "Visible"},
+                templateId="TextBox1", parentId="GRID001",
+                parentProperties=ParentProperties(column=2, row=1)),
+        Control(id="DDL001", name="DropdownGender", type="Dropdown",
+                properties={"options": ["Male", "Female", "Other"], "value": "", "visible": "Visible"},
+                templateId="Dropdown1", parentId="GRID001",
+                parentProperties=ParentProperties(column=2, row=2)),
+        Control(id="BTN001", name="SubmitButton", type="Button",
+                properties={"text": "Submit", "disabled": False, "visible": "Visible"},
+                templateId="Button1", parentId="GRID001",
+                parentProperties=ParentProperties(column=2, row=5))
+    ],
+    vNodes=[], clientTriggers=[], serverTriggers=[]
+).model_dump()
+
+# ------- JSON Extraction Helper -------
+def extract_json(text: str) -> str:
+    text = re.sub(r"\`\`\`[a-zA-Z0-9]*\n?", "", text)
+    text = text.replace("```", "")
+    start = text.find("{")
+    if start == -1:
+        return text.strip()
+    depth = 0
+    for i, ch in enumerate(text[start:], start):
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start:i+1].strip()
+    return text.strip()
+
+# ------- Run LLM -------
+def run_llm(prompt: str):
+    process = subprocess.Popen(
+        ["ollama", "run", "deepseek-coder:1.3b", prompt],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        text=True
+    )
+    output = []
+    for line in process.stdout:
+        output.append(line)
+    raw_output = "".join(output).strip()
+    cleaned_output = extract_json(raw_output)
+    return raw_output, cleaned_output
+
+# ------- Safe JSON loader -------
+def safe_json_loads(s: str):
+    try:
+        return json.loads(s)
+    except json.JSONDecodeError:
+        open_braces = s.count("{")
+        close_braces = s.count("}")
+        if open_braces > close_braces:
+            s += "}" * (open_braces - close_braces)
+        return json.loads(s)
+
+# ------- Validation Helper -------
+def validate_formdefinition(payload):
+    if hasattr(FormDefinition, "model_validate"):  # Pydantic v2
+        return FormDefinition.model_validate(payload)
+    return FormDefinition.parse_obj(payload)
+
+# ------- API Endpoint -------
+@app.route('/generate', methods=['POST'])
+def generate_json():
+    data = request.get_json()
+    user_prompt = (data.get("prompt") or "").strip()
+    if not user_prompt:
+        return jsonify({"error": "Please provide a 'prompt'"}), 400
+
+    base_instructions = f"""
+You are a JSON UI generator for NextGenForms Studio.
+
+STRICT RULES:
+1. Respond ONLY with valid JSON — no markdown, no explanations, no code fences.
+2. Your JSON MUST follow this compact schema example:
+{json.dumps(example_form, indent=2)}
+3. Use only these control types: {", ".join(valid_controls)}
+4. Create a form exactly as described in the user's prompt.
+5. Form must be at least one full page with minimum 5 controls and 3 different control types.
+6. Layout: default to Grid with meaningful arrangement.
+7. Fill all property fields with useful values.
+8. No comments, narrative, or empty objects/arrays unless required.
+
+User Prompt:
+{user_prompt}
+"""
+
+    raw = cleaned = None
+    MAX_RETRIES = 3
+    for attempt in range(MAX_RETRIES):
+        try:
+            raw, cleaned = run_llm(base_instructions)
+            json_output = safe_json_loads(cleaned)
+            form_obj = validate_formdefinition(json_output)
+
+            if not form_obj.controls:
+                return jsonify({"error": "Generated form is empty", "raw_output": raw}), 400
+
+            if hasattr(form_obj, "model_dump"):
+                return jsonify(form_obj.model_dump())
+            return jsonify(form_obj.dict())
+
+        except (json.JSONDecodeError, ValidationError):
+            if attempt == MAX_RETRIES - 1:
+                return jsonify({"error": "Model output was not valid JSON", "raw_output": raw}), 500
+            base_instructions += "\nEnsure output is STRICTLY valid JSON. Do not truncate."
+
+        except subprocess.TimeoutExpired:
+            return jsonify({"error": "Ollama command timed out"}), 504
+        except subprocess.CalledProcessError as e:
+            return jsonify({"error": "Ollama command failed", "details": e.stderr}), 500
+
+if __name__ == '__main__':
+    app.run(debug=True)
+
+
+
+from typing import List, Optional, Dict, Any, Literal, Union
+from pydantic import BaseModel
+
+# --- Updated control types ---
+ControlType = Literal[
+    "Button", "Grid", "TextBox", "Dropdown", "StackPanel", "TextBlock", "ToggleButton",
+    "CheckBox", "CheckBoxGroup", "Radio", "RadioGroup", "FormViewer", "Icon",
+    "Hyperlink", "Tab", "TableViewer", "DatePicker", "InputMask", "Image", "Password",
+    "TextArea", "Rating", "Webviewer", "ValidationPlaceholder", "AutoCompleteTextbox",
+    "FileUpload", "Repeater", "Header", "Canvas", "RichTextBox", "RichText", "HtmlViewer",
+    "ConditionalViewer", "Label", "FormRouter", "Chips", "DataGrid"
+]
+
+# --- Layout models ---
+class Dimension(BaseModel):
+    size: Optional[int] = None
+    unit: Optional[str] = None
+
+class Column(BaseModel):
+    id: int
+    width: Dimension
+
+class Row(BaseModel):
+    id: int
+    height: Dimension
+
+class GridProperties(BaseModel):
+    columnGap: Dimension
+    rowGap: Dimension
+    columns: List[Column]
+    rows: List[Row]
+
+class ParentProperties(BaseModel):
+    column: Optional[int] = None
+    row: Optional[int] = None
+
+# --- Control-specific property models ---
+class TextBoxProperties(BaseModel):
+    value: str
+    placeholder: str
+    valueType: str
+    visible: str
+
+class TextBlockProperties(BaseModel):
+    text: str
+    editable: bool
+    visible: str
+
+class ButtonProperties(BaseModel):
+    text: Optional[str] = None
+    label: Optional[str] = None
+    disabled: Optional[bool] = False
+    visible: str
+
+class FileUploadProperties(BaseModel):
+    accept: str
+    maxSize: int
+    visible: str
+
+class DropdownProperties(BaseModel):
+    options: List[str]
+    value: Optional[str] = ""
+    visible: str
+
+class DateTimePickerProperties(BaseModel):
+    value: str
+    placeholder: str
+    visible: str
+
+# --- Union type for all properties ---
+ControlPropertiesType = Union[
+    GridProperties,
+    TextBoxProperties,
+    TextBlockProperties,
+    ButtonProperties,
+    FileUploadProperties,
+    DropdownProperties,
+    DateTimePickerProperties,
+    Dict[str, Any]  # fallback for unknown or future controls
+]
+
+# --- Core Control model ---
+class Control(BaseModel):
+    id: str
+    name: str
+    type: ControlType
+    properties: ControlPropertiesType
+    templateId: str
+    parentId: Optional[str] = None
+    parentProperties: Optional[ParentProperties] = None
+
+# --- Root FormDefinition model ---
+class FormDefinition(BaseModel):
+    clientWorkflows: List[Any] = []
+    serverWorkflows: List[Any] = []
+    controls: List[Control]
+    vNodes: List[Any] = []
+    clientTriggers: List[Any] = []
+    serverTriggers: List[Any] = []
+
+
+
+==================================
+
+
+
+{
+  "prompt": "Create a full student admission form with at least 8 controls including text inputs for full name, email, phone number, a date picker for date of birth, dropdown for gender with options Male,Female,Other, a photo upload control, and a submit button. Arrange the form in a grid with labels in the first column and inputs in the second column. Ensure all controls have meaningful placeholders and are visible."
+}
+
+
+Prompt Example 1 – Student Admission Form
+json
+{
+  "prompt": "Full-page student admission form with 15+ fields: name, email, phone, DOB, gender dropdown, address (street, city, state, zip), parent/guardian, emergency contact, previous school, photo upload, signature pad, hobbies multi-select, terms checkbox, and submit. Grid layout with labels col1, inputs col2."
+}
+Prompt Example 2 – Employee Onboarding
+json
+{
+  "prompt": "Create full-page employee onboarding form with 15+ fields: full name, email, phone, date of birth, gender dropdown, position, department dropdown, joining date picker, address fields, emergency contact, resume file upload, photo upload, skills multi-select, terms checkbox, and submit. Grid layout, labels in first column."
+}
+Prompt Example 3 – Hospital Patient Registration
+json
+{
+  "prompt": "Generate patient registration form with 15+ fields: full name, gender dropdown, date of birth, phone, email, address fields, blood group dropdown, known allergies textarea, medical history textarea, emergency contact, insurance provider, insurance policy number, photo upload, current symptoms textarea, terms checkbox, and submit button. Use grid layout."
+}
+Prompt Example 4 – Conference Registration
+json
+{
+  "prompt": "Conference registration form with 15+ fields: full name, email, phone, organization, designation, country dropdown, state/province, city, address, arrival date picker, departure date picker, session choices multi-select, dietary preference dropdown, ID proof file upload, payment method dropdown, terms checkbox, and submit. Use grid with labels col1 inputs col2."
+}
+Prompt Example 5 – E-commerce Product Entry Form
+json
+{
+  "prompt": "Create product entry form with 15+ fields: product name, SKU, category dropdown, description textarea, price number input, stock quantity, weight, dimensions, color dropdown, material, brand, images upload, spec sheet file upload, warranty period, availability toggle switch, featured toggle, terms checkbox, and submit. Use grid layout with labels in first column."
+}
+
+
+++++++==========================++++++++++++++++++++++++++++++++++++
+{
+  "prompt": "I want to create a form on my website where people can fill in their first name, last name, email address, and phone number. The form should look neat and user-friendly, and there should be a Submit button at the bottom. Make sure all the fields are properly labeled and required to fill. Also, place everything nicely on one page with a clear layout."
+}
